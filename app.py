@@ -1,54 +1,116 @@
 import streamlit as st
 from PyPDF2 import PdfReader, PdfWriter
 import zipfile
-import os
+import io
 import re
+import unicodedata
 
-def extract_bol_number(text, fallback):
-    match = re.search(r"BOL Number:\s*(PLS\d+)", text)
-    return match.group(1) if match else fallback
+st.set_page_config(page_title="BOL/Invoice Splitter", page_icon="📄")
 
-def split_and_zip_pdf(uploaded_file):
-    # Create or clear the output directory
-    temp_dir = os.path.join(os.getcwd(), "output")
-    os.makedirs(temp_dir, exist_ok=True)
-    for f in os.listdir(temp_dir):
-        os.remove(os.path.join(temp_dir, f))
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
+def sanitize_filename(name: str, maxlen: int = 120) -> str:
+    # Remove accents, normalize Unicode, keep safe chars
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(ch for ch in name if not unicodedata.combining(ch))
+    # Replace forbidden filename chars
+    name = re.sub(r'[\\/*?:"<>|]+', "_", name)
+    name = normalize_ws(name).replace(" ", "_")
+    return name[:maxlen] or "Untitled"
+
+# --- NEW: robust extractors for EDI Import Primary Reference, with fallbacks ---
+def extract_primary_reference(text: str) -> str | None:
+    """
+    Prefer: EDI Import Primary Reference: PCL43613
+    OCR/format tolerant: allow extra spaces, optional colon, etc.
+    """
+    # Primary: exact label (tolerant spacing/case)
+    pat_primary = re.compile(
+        r"EDI\s*Import\s*Primary\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,})",
+        flags=re.IGNORECASE
+    )
+    m = pat_primary.search(text)
+    if m:
+        return normalize_ws(m.group(1))
+
+    # Fallback 1: Shipment Matching Reference: PCL43613-1-2  -> take left side of the first dash
+    pat_match_ref = re.compile(
+        r"Shipment\s*Matching\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,}(?:[-_/][A-Za-z0-9]+)*)",
+        flags=re.IGNORECASE
+    )
+    m2 = pat_match_ref.search(text)
+    if m2:
+        left = m2.group(1).split("-", 1)[0]
+        return normalize_ws(left)
+
+    return None
+
+def split_pdf_pages_to_zip(uploaded_file) -> bytes:
     reader = PdfReader(uploaded_file)
-    split_files = []
+    seen = set()
 
-    for i, page in enumerate(reader.pages):
-        writer = PdfWriter()
-        writer.add_page(page)
+    zip_mem = io.BytesIO()
+    with zipfile.ZipFile(zip_mem, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        progress = st.progress(0, text="Processing pages…")
+        total_pages = len(reader.pages)
 
-        text = page.extract_text() or ""
-        bol_number = extract_bol_number(text, f"Page_{i+1}")
-        filename = f"{bol_number}.pdf"
-        output_path = os.path.join(temp_dir, filename)
+        for i, page in enumerate(reader.pages, start=1):
+            writer = PdfWriter()
+            writer.add_page(page)
 
-        with open(output_path, "wb") as f:
-            writer.write(f)
-        split_files.append(output_path)
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
 
-    # Create the zip file
-    zip_path = os.path.join(temp_dir, "BOL_PDFs.zip")
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for file_path in split_files:
-            zipf.write(file_path, arcname=os.path.basename(file_path))
+            ident = extract_primary_reference(text)
+            if not ident:
+                ident = f"Page_{i}"
 
-    return zip_path
+            fname = sanitize_filename(ident)
+            # De-dupe filenames
+            base = fname
+            n = 2
+            while fname in seen:
+                fname = f"{base}_p{i}" if n == 2 else f"{base}_p{i}_{n}"
+                n += 1
+            seen.add(fname)
 
-# Streamlit UI
-st.title("BOL PDF Splitter")
-st.write("Upload a multi-page PDF of Bills of Lading. Each page will be split and named by its BOL Number, then packaged into a ZIP file for download.")
+            # Write page PDF to memory and into ZIP
+            pdf_bytes = io.BytesIO()
+            writer.write(pdf_bytes)
+            pdf_bytes.seek(0)
+            zipf.writestr(f"{fname}.pdf", pdf_bytes.read())
 
-uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+            progress.progress(i / total_pages, text=f"Processed page {i}/{total_pages}")
+
+    zip_mem.seek(0)
+    return zip_mem.read()
+
+# ---------------- UI ----------------
+st.title("📄 PDF Splitter → Name by EDI Import Primary Reference")
+st.write(
+    "Upload a multi-page PDF. Each page will be split and named by its **EDI Import Primary Reference** "
+    "(e.g., `PCL43613`). If missing, the app falls back to **Shipment Matching Reference** (left side before any dash), "
+    "then to `Page_#`."
+)
+
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 
 if uploaded_file is not None:
     if st.button("Process PDF"):
-        with st.spinner("Splitting and zipping your file..."):
-            zip_file_path = split_and_zip_pdf(uploaded_file)
-            with open(zip_file_path, "rb") as f:
-                st.success("Done! Download your ZIP file below.")
-                st.download_button("Download ZIP", f, file_name="BOL_PDFs.zip")
+        try:
+            with st.spinner("Splitting and zipping your file…"):
+                zip_bytes = split_pdf_pages_to_zip(uploaded_file)
+            st.success("Done! Download your ZIP file below.")
+            st.download_button(
+                "Download ZIP",
+                data=zip_bytes,
+                file_name="Split_by_EDI_Primary_Ref.zip",
+                mime="application/zip",
+            )
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
+else:
+    st.info("Upload a multi-page PDF to get started.")
