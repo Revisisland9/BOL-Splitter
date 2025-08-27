@@ -5,52 +5,72 @@ import io
 import re
 import unicodedata
 
-st.set_page_config(page_title="BOL/Invoice Splitter", page_icon="📄")
+st.set_page_config(page_title="PDF Splitter (Primary Reference / EDI)", page_icon="📄")
 
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def sanitize_filename(name: str, maxlen: int = 120) -> str:
-    # Remove accents, normalize Unicode, keep safe chars
     name = unicodedata.normalize("NFKD", name)
     name = "".join(ch for ch in name if not unicodedata.combining(ch))
-    # Replace forbidden filename chars
     name = re.sub(r'[\\/*?:"<>|]+', "_", name)
     name = normalize_ws(name).replace(" ", "_")
     return name[:maxlen] or "Untitled"
 
-# --- NEW: robust extractors for EDI Import Primary Reference, with fallbacks ---
-def extract_primary_reference(text: str) -> str | None:
+# ------- Pattern helpers (ordered by priority per mode) -------
+def patterns_for_mode(mode: str):
     """
-    Prefer: EDI Import Primary Reference: PCL43613
-    OCR/format tolerant: allow extra spaces, optional colon, etc.
+    Returns a list of (label, regex, postprocess_fn_or_None) tuples in search order.
     """
-    # Primary: exact label (tolerant spacing/case)
-    pat_primary = re.compile(
-        r"EDI\s*Import\s*Primary\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,})",
-        flags=re.IGNORECASE
-    )
-    m = pat_primary.search(text)
-    if m:
-        return normalize_ws(m.group(1))
+    def trim_left_token(g):
+        # For "Shipment Matching Reference: PCL43613-1-2" → "PCL43613"
+        return g.split("-", 1)[0]
 
-    # Fallback 1: Shipment Matching Reference: PCL43613-1-2  -> take left side of the first dash
-    pat_match_ref = re.compile(
-        r"Shipment\s*Matching\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,}(?:[-_/][A-Za-z0-9]+)*)",
-        flags=re.IGNORECASE
-    )
-    m2 = pat_match_ref.search(text)
-    if m2:
-        left = m2.group(1).split("-", 1)[0]
-        return normalize_ws(left)
+    edi_core = [
+        ("EDI Import Primary Reference",
+         r"EDI\s*Import\s*Primary\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,}[A-Za-z0-9\-]*)",
+         None),
+        ("Shipment Matching Reference",
+         r"Shipment\s*Matching\s*Reference\s*[:\-]?\s*([A-Z]{2,5}\d{4,}(?:[-_/][A-Za-z0-9]+)*)",
+         trim_left_token),
+    ]
 
+    legacy_core = [
+        ("Primary Reference / Primary Ref",
+         r"\bPrimary\s*Ref(?:erence)?\s*[:\-]?\s*([A-Z]{2,5}\d{4,}[A-Za-z0-9\-]*)",
+         None),
+        ("BOL Number",
+         r"\bBOL(?:\s*Number|\s*No\.?|#)?\s*[:\-]?\s*([A-Z]{2,5}\d{4,}[A-Za-z0-9\-]*)",
+         None),
+    ]
+
+    loose = [
+        ("Loose PLS/PCL token",
+         r"\b(?:PLS|PCL)[-]?\d{4,}[A-Za-z0-9\-]*\b",
+         None),
+    ]
+
+    if mode == "EDI Import":
+        return edi_core + legacy_core + loose
+    if mode == "Legacy: Primary Reference":
+        return legacy_core + edi_core + loose
+    # Auto
+    return edi_core + legacy_core + loose
+
+def extract_identifier(text: str, mode: str) -> str | None:
+    patt_list = patterns_for_mode(mode)
+    for _label, patt, post in patt_list:
+        m = re.search(patt, text or "", flags=re.IGNORECASE)
+        if m:
+            g = normalize_ws(m.group(1) if m.lastindex else m.group(0))
+            return normalize_ws(post(g) if post else g)
     return None
 
-def split_pdf_pages_to_zip(uploaded_file) -> bytes:
+def split_pdf_pages_to_zip(uploaded_file, mode: str) -> bytes:
     reader = PdfReader(uploaded_file)
     seen = set()
-
     zip_mem = io.BytesIO()
+
     with zipfile.ZipFile(zip_mem, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         progress = st.progress(0, text="Processing pages…")
         total_pages = len(reader.pages)
@@ -64,20 +84,17 @@ def split_pdf_pages_to_zip(uploaded_file) -> bytes:
             except Exception:
                 text = ""
 
-            ident = extract_primary_reference(text)
-            if not ident:
-                ident = f"Page_{i}"
-
+            ident = extract_identifier(text, mode) or f"Page_{i}"
             fname = sanitize_filename(ident)
+
             # De-dupe filenames
             base = fname
-            n = 2
+            suff = 2
             while fname in seen:
-                fname = f"{base}_p{i}" if n == 2 else f"{base}_p{i}_{n}"
-                n += 1
+                fname = f"{base}_p{i}" if suff == 2 else f"{base}_p{i}_{suff}"
+                suff += 1
             seen.add(fname)
 
-            # Write page PDF to memory and into ZIP
             pdf_bytes = io.BytesIO()
             writer.write(pdf_bytes)
             pdf_bytes.seek(0)
@@ -88,13 +105,24 @@ def split_pdf_pages_to_zip(uploaded_file) -> bytes:
     zip_mem.seek(0)
     return zip_mem.read()
 
-# ---------------- UI ----------------
-st.title("📄 PDF Splitter → Name by EDI Import Primary Reference")
+# -------------------- UI --------------------
+st.title("📄 PDF Splitter → Name by Primary Reference / EDI Import")
 st.write(
-    "Upload a multi-page PDF. Each page will be split and named by its **EDI Import Primary Reference** "
-    "(e.g., `PCL43613`). If missing, the app falls back to **Shipment Matching Reference** (left side before any dash), "
-    "then to `Page_#`."
+    "Split a multi-page PDF and name each page by an identifier. "
+    "Use the sidebar to choose the document profile."
 )
+
+with st.sidebar:
+    mode = st.selectbox(
+        "Doc profile",
+        ["Auto (recommended)", "EDI Import", "Legacy: Primary Reference"],
+        index=0
+    )
+    st.caption(
+        "- **Auto**: tries EDI Import, Primary Reference, then fallbacks.\n"
+        "- **EDI Import**: prioritizes *EDI Import Primary Reference*.\n"
+        "- **Legacy**: prioritizes *Primary Reference*."
+    )
 
 uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 
@@ -102,12 +130,12 @@ if uploaded_file is not None:
     if st.button("Process PDF"):
         try:
             with st.spinner("Splitting and zipping your file…"):
-                zip_bytes = split_pdf_pages_to_zip(uploaded_file)
+                zip_bytes = split_pdf_pages_to_zip(uploaded_file, mode)
             st.success("Done! Download your ZIP file below.")
             st.download_button(
                 "Download ZIP",
                 data=zip_bytes,
-                file_name="Split_by_EDI_Primary_Ref.zip",
+                file_name="Split_Pages.zip",
                 mime="application/zip",
             )
         except Exception as e:
